@@ -1,0 +1,498 @@
+import torch
+import timm
+
+import torch.nn as nn
+from torchinfo import summary
+import torch.nn.functional as F
+from sklearn.metrics import roc_auc_score
+from timm.loss import SoftTargetCrossEntropy
+from timm.models.registry import register_model
+from timm.models.layers import trunc_normal_, DropPath
+
+import os
+import json
+import wandb
+import numpy as np
+import pandas as pd
+from tqdm import tqdm 
+
+import warnings
+warnings.filterwarnings("ignore")
+
+import torchvision
+from PIL import Image, ImageFile
+from torch.utils.data import Dataset
+from torch.utils.data import random_split
+import torchvision.transforms as transforms 
+
+from datetime import datetime
+import matplotlib.pyplot as plt
+from torchmetrics.classification import ROC
+from torchmetrics.functional.classification import multilabel_accuracy, multilabel_auroc
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+import os
+import torch
+import random
+import copy
+import csv
+from PIL import Image
+
+from torch.utils.data import Dataset
+import torchvision.transforms as transforms
+from torch.utils.data.dataset import Dataset
+import numpy as np
+import pydicom as dicom
+import cv2
+from skimage import transform, io, img_as_float, exposure
+from albumentations import (
+    Compose, HorizontalFlip, CLAHE, HueSaturationValue,
+    RandomBrightness, RandomBrightnessContrast, RandomGamma,OneOf,
+    ToFloat, ShiftScaleRotate,GridDistortion, ElasticTransform, JpegCompression, HueSaturationValue,
+    RGBShift, RandomBrightness, RandomContrast, Blur, MotionBlur, MedianBlur, GaussNoise,CenterCrop,
+    IAAAdditiveGaussianNoise,GaussNoise,OpticalDistortion,RandomSizedCrop
+)
+
+
+
+def build_transform_classification(normalize, crop_size=224, resize=256, mode="train", test_augment=True):
+    transformations_list = []
+
+    if normalize.lower() == "imagenet":
+      normalize = transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    elif normalize.lower() == "chestx-ray":
+      normalize = transforms.Normalize([0.5056, 0.5056, 0.5056], [0.252, 0.252, 0.252])
+    elif normalize.lower() == "none":
+      normalize = None
+    else:
+      print("mean and std for [{}] dataset do not exist!".format(normalize))
+      exit(-1)
+    if mode == "train":
+      transformations_list.append(transforms.RandomResizedCrop(crop_size))
+      transformations_list.append(transforms.RandomHorizontalFlip())
+      transformations_list.append(transforms.RandomRotation(7))
+      transformations_list.append(transforms.ToTensor())
+      if normalize is not None:
+        transformations_list.append(normalize)
+    elif mode == "valid":
+      transformations_list.append(transforms.Resize((resize, resize)))
+      transformations_list.append(transforms.CenterCrop(crop_size))
+      transformations_list.append(transforms.ToTensor())
+      if normalize is not None:
+        transformations_list.append(normalize)
+    elif mode == "test":
+      if test_augment:
+        transformations_list.append(transforms.Resize((resize, resize)))
+        transformations_list.append(transforms.TenCrop(crop_size))
+        transformations_list.append(
+          transforms.Lambda(lambda crops: torch.stack([transforms.ToTensor()(crop) for crop in crops])))
+        if normalize is not None:
+          transformations_list.append(transforms.Lambda(lambda crops: torch.stack([normalize(crop) for crop in crops])))
+      else:
+        transformations_list.append(transforms.Resize((resize, resize)))
+        transformations_list.append(transforms.CenterCrop(crop_size))
+        transformations_list.append(transforms.ToTensor())
+        if normalize is not None:
+          transformations_list.append(normalize)
+    transformSequence = transforms.Compose(transformations_list)
+
+    return transformSequence
+
+def build_transform_segmentation():
+  AUGMENTATIONS_TRAIN = Compose([
+    # HorizontalFlip(p=0.5),
+    OneOf([
+        RandomBrightnessContrast(),
+        RandomGamma(),
+         ], p=0.3),
+    OneOf([
+        ElasticTransform(alpha=120, sigma=120 * 0.05, alpha_affine=120 * 0.03),
+        GridDistortion(),
+        OpticalDistortion(distort_limit=2, shift_limit=0.5),
+        ], p=0.3),
+    RandomSizedCrop(min_max_height=(156, 224), height=224, width=224,p=0.25),
+    ToFloat(max_value=1)
+    ],p=1)
+
+  return AUGMENTATIONS_TRAIN
+
+
+
+
+class ChestXray14Dataset(Dataset):
+
+  def __init__(self, images_path, file_path, augment, num_class=14, annotation_percent=100):
+
+    self.img_list = []
+    self.img_label = []
+    self.augment = augment
+
+    with open(file_path, "r") as fileDescriptor:
+      line = True
+
+      while line:
+        line = fileDescriptor.readline()
+
+        if line:
+          lineItems = line.split()
+
+          imagePath = os.path.join(images_path, lineItems[0])
+          imageLabel = lineItems[1:num_class + 1]
+          imageLabel = [int(i) for i in imageLabel]
+
+          self.img_list.append(imagePath)
+          self.img_label.append(imageLabel)
+
+    indexes = np.arange(len(self.img_list))
+    if annotation_percent < 100:
+      random.Random(99).shuffle(indexes)
+      num_data = int(indexes.shape[0] * annotation_percent / 100.0)
+      indexes = indexes[:num_data]
+
+      _img_list, _img_label = copy.deepcopy(self.img_list), copy.deepcopy(self.img_label)
+      self.img_list = []
+      self.img_label = []
+
+      for i in indexes:
+        self.img_list.append(_img_list[i])
+        self.img_label.append(_img_label[i])
+
+  def __getitem__(self, index):
+
+    imagePath = self.img_list[index]
+
+    imageData = Image.open(imagePath).convert('RGB')
+    imageLabel = torch.FloatTensor(self.img_label[index])
+
+    if self.augment != None: imageData = self.augment(imageData)
+
+    return imageData, imageLabel
+
+  def __len__(self):
+
+    return len(self.img_list)
+
+
+
+class CheXpertDataset(Dataset):
+    def __init__(
+        self, 
+        dataframe, 
+        dataset_path,
+        uncertain_label="Zeros",
+        unknown_label=0,
+        images_size=224
+    ):  
+        self.df = dataframe
+        
+        assert uncertain_label in ["Ones", "Zeros", "LSR-Ones", "LSR-Zeros"]
+        self.uncertain_label = uncertain_label
+        
+        if self.uncertain_label == "Ones":
+            self.df.iloc[:, 6:] = self.df.iloc[:, 6:].map(lambda x: 1 if x==-1 else x)
+        elif self.uncertain_label == "Zeros":
+            self.df.iloc[:, 6:] = self.df.iloc[:, 6:].map(lambda x: 0 if x==-1 else x)
+        elif self.uncertain_label == "LSR-Ones":
+            self.df.iloc[:, 6:] = self.df.iloc[:, 6:].map(lambda x: np.random.uniform(0.55, 0.85) if x==-1 else x)
+        elif self.uncertain_label == "LSR-Zeros":
+            self.df.iloc[:, 6:] = self.df.iloc[:, 6:].map(lambda x: np.random.uniform(0, 0.3) if x==-1 else x)
+
+        self.df.iloc[: ,6:] = self.df.iloc[: ,6:].fillna(unknown_label)
+
+        self.base_path = dataset_path
+        self.image_paths = self.df.iloc[:, 0].to_numpy()
+        self.labels = self.df.iloc[:, 6:].to_numpy()
+        
+        self.transform = transforms.Compose([
+            transforms.Resize((images_size, images_size)),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        ])
+
+    def __getitem__(self, index):
+        img = self.transform(
+            Image.open(
+                os.path.join(self.base_path,self.image_paths[index])
+            ).convert('RGB')
+        )
+        label = torch.FloatTensor(self.labels[index])
+        
+        return img, label
+
+    def __len__(self):
+        return self.df.shape[0]
+
+def evaluate_model(model, test_dataloader, device, activation, draw_roc=False):
+    model.eval()    
+    
+    y_true, y_pred = [], []
+
+    with torch.no_grad():
+        for images, labels in tqdm(test_dataloader):
+            torch.cuda.empty_cache()
+            y_true += labels.cpu().numpy().tolist()
+            y_pred += model(images.to(DEVICE)).cpu().numpy().tolist()
+
+    y_true = torch.tensor(y_true)
+    y_pred = torch.tensor(y_pred)
+    
+    # calculate auc
+    individual_auc = multilabel_auroc(activation(y_pred.cpu()), y_true.cpu().type(torch.int), num_labels=14, average=None, thresholds=None).numpy()
+
+    # calculate acc
+    individual_acc = multilabel_accuracy(activation(y_pred.cpu()), y_true.cpu().type(torch.int), num_labels=14, average=None).numpy()
+    
+    # calculate values for drawing roc curve
+    if draw_roc:
+        roc = ROC(task='multilabel', num_labels=14)
+        fpr, tpr, thresholds = roc(y_pred, y_true.type(torch.int))
+        
+        fpr_list = [item.numpy() for item in fpr]
+        tpr_list = [item.numpy() for item in tpr]
+        thresh_list = [item.numpy() for item in thresholds]
+    
+    
+        return {
+            "AUC": np.float16(individual_auc).tolist(),
+            "ACC": np.float16(individual_acc).tolist(),
+            "mAUC": individual_auc.mean(),
+            "mACC": individual_acc.mean(),
+            "fpr": fpr_list, 
+            "tpr": tpr_list, 
+            "thresholds": thresh_list
+        }
+    else:
+        return {
+            "AUC": individual_auc,
+            "ACC": individual_acc,
+            "mAUC": individual_auc.mean(),
+            "mACC": individual_acc.mean(),
+        }
+
+def plot_roc(roc):
+    CLASS_MAPPING = {
+        0: 'Enlarged Cardiomediastinum',
+        1: 'Cardiomegaly',
+        2: 'Lung Opacity',
+        3: 'Lung Lesion',
+        4: 'Edema',
+        5: 'Consolidation',
+        6: 'Pneumonia',
+        7: 'Atelectasis',
+        8: 'Pneumothorax',
+        9: 'Pleural Effusion',
+        10: 'Pleural Other',
+        11: 'Fracture',
+        12: 'Support Devices',
+        13: 'No Finding'
+    }
+    
+    fpr_list, tpr_list = roc['fpr'], roc['tpr']
+    
+    # Create a new figure
+    plt.figure(figsize=(8, 6))
+
+    # Plot ROC curve for each set of FPR and TPR
+    for fpr, tpr in zip(fpr_list, tpr_list):
+        plt.plot(fpr, tpr)
+
+    # Customize the plot
+    plt.xlabel('1-Specificity')
+    plt.ylabel('Sensitivity')
+    plt.title('ConvNeXT-Chexpert')
+    plt.legend(CLASS_MAPPING.values())
+    plt.savefig(f"convnext-chexpert-roc-{datetime.now().strftime('%m%d%H%M')}.jpg")
+    plt.show()
+
+def get_model(pretrained, name, num_labels, in_channels=3):
+        return nn.Sequential(*list(timm.create_model(name, pretrained=pretrained, num_classes=num_labels,  in_chans=in_channels).children()))
+
+
+if __name__=="__main__":
+    DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
+    DEVICES = [i for i in range(torch.cuda.device_count())]
+    
+    BATCH_SIZE = 32
+    NUM_WORKERS = 32
+    IMAGE_SIZE = 224
+    
+    #csv_path = "../../scratch/abalas40/classification/chexpertchestxrays-u20210408/train_exist.csv"
+    #val_csv_path = "../../scratch/abalas40/classification/chexpertchestxrays-u20210408/CheXpert-v1.0/valid_exist.csv"
+    #dataset_path = "../../scratch/abalas40/classification/chexpertchestxrays-u20210408"
+    
+    #model_save_path = "../../scratch/abalas40/models/classification/chexpertv2.pth"
+    
+    #checkpoint = torch.load(model_save_path)
+    
+    #train_df = pd.read_csv(csv_path) #.sample(10000)
+    #test_df = pd.read_csv(val_csv_path)
+    
+    #entire_dataset = CheXpertDataset(train_df, dataset_path, images_size=IMAGE_SIZE)
+    #train_ds, val_ds = random_split(entire_dataset, [0.8, 0.2])
+    #test_ds = CheXpertDataset(test_df, dataset_path, images_size=IMAGE_SIZE)
+
+    csv_path ="/home/kbylapud/week2/BenchmarkTransformers-main/BenchmarkTransformers-main/dataset/Xray14_train_official.txt"
+    val_csv_path = "/home/kbylapud/week2/BenchmarkTransformers-main/BenchmarkTransformers-main/dataset/Xray14_val_official.txt"
+    dataset_path = "/scratch/kbylapud/chest_x_ray_14/CXR8/images/images"
+    
+    model_save_path = "./Models/Classification/SwinV2.pth"
+    
+    checkpoint = torch.load(model_save_path)
+    
+    train_df = pd.read_csv(csv_path) #.sample(10000)
+    test_df = pd.read_csv(val_csv_path)
+    
+    entire_dataset = ChestXray14Dataset(train_df, dataset_path, images_size=IMAGE_SIZE)
+    train_ds, val_ds = random_split(entire_dataset, [0.8, 0.2])
+    test_ds = ChestXray14Dataset(test_df, dataset_path, images_size=IMAGE_SIZE)
+    
+    train_loader = torch.utils.data.DataLoader(
+        train_ds,
+        batch_size=BATCH_SIZE,
+        num_workers=NUM_WORKERS,
+        shuffle=True,
+    )
+    
+    val_loader = torch.utils.data.DataLoader(
+        val_ds,
+        batch_size=BATCH_SIZE,
+        num_workers=NUM_WORKERS,
+        shuffle=False,
+    )
+    
+    test_loader = torch.utils.data.DataLoader(
+        test_ds,
+        batch_size=BATCH_SIZE,
+        num_workers=NUM_WORKERS,
+        shuffle=False,
+    )
+    
+    model = get_model(True,'convnextv2_base', 14)
+    
+    for param in model[0].parameters():
+        param.requires_grad = False
+    for param in model[1].parameters():
+        param.requires_grad = False
+    for param in model[2].parameters():
+        param.requires_grad = False
+    
+    for param in model[3].parameters():
+        param.requires_grad = True
+    
+    model.load_state_dict(checkpoint['model_state_dict'])
+    
+    if torch.cuda.device_count() > 1:
+        print("found more than one gpu")
+        model = nn.DataParallel(model)
+    
+    model = model.to(DEVICE)
+    
+    EPOCHS = 20
+    LEARNING_RATE = 0.01
+    
+    try:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE) 
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        
+        loss_fn = nn.BCEWithLogitsLoss()
+        activation = torch.nn.Sequential()
+        
+        output = []
+        
+        wandb_config = {
+            "learning_rate": LEARNING_RATE,
+            "model_architecture": "ConvNeXT-v2",
+            "model_size": "base",
+            "dataset": "CheXpert",
+            "epochs": EPOCHS,
+            "batch": BATCH_SIZE,
+            "num_workers": NUM_WORKERS,
+            "image_size": IMAGE_SIZE,
+            "devices": f"{DEVICE} - {str(DEVICES)}"
+        }
+        
+        wandb.init(project="image_analytics", config=wandb_config)
+        
+        # Training
+        for epoch in range(EPOCHS):
+            print("Epoch:", epoch+1)
+            wandb.log({"epoch": epoch})
+
+            # Train
+            print("Train Step:")
+            train_losses, train_accs, train_aucs = [], [], []
+            model.train()
+            for idx, batch in enumerate(tqdm(train_loader)):
+                images, labels = batch[0], batch[1]
+                optimizer.zero_grad()
+                
+                outputs = model(images.to(DEVICE)) 
+                outputs = activation(outputs)
+                loss = loss_fn(outputs, labels.to(DEVICE)) 
+                loss.backward() 
+                optimizer.step() 
+                
+                train_losses.append(loss.item())
+            
+            print(f"Loss:{np.mean(train_losses)}") 
+        
+            # Evaluation
+            print("Evaluation Step:")
+            eval_step = evaluate_model(model, val_loader, DEVICE, activation)
+            print(f"Classwise Accuracy:{eval_step['ACC']}") 
+            print(f"Mean Accuracy:{eval_step['mACC']}") 
+            print(f"Classwise AUC:{eval_step['AUC']}") 
+            print(f"Mean AUC:{eval_step['mAUC']}")
+        
+            output.append({
+                "train": {"loss": np.mean(train_losses)},
+                "evaluation": {
+                    "classwise": {"auc": eval_step["AUC"], "acc": eval_step["ACC"]},
+                    "mean": {"auc": eval_step["mAUC"], "acc": eval_step["mACC"]}
+                }
+            })
+        
+            wandb.log({
+                "epoch": epoch,
+                "train_loss": np.mean(train_losses),
+                "eval_mAUC": eval_step["mAUC"],
+                "eval_mACC": eval_step["mACC"],
+            })
+        
+            print("\n\n")
+            
+        # Test
+        print("Test Step:")
+        test_step = evaluate_model(model, test_loader, DEVICE, activation, True)
+        print(f"Classwise Accuracy:{test_step['ACC']}")
+        print(f"Mean Accuracy:{test_step['mACC']}")
+        print(f"Classwise AUC:{test_step['AUC']}")
+        print(f"Mean AUC:{test_step['mAUC']}")
+        plot_roc(test_step)
+        
+        output.append({
+            "test": {
+                "classwise": {"auc": test_step["AUC"], "acc": test_step["ACC"]},
+                "mean": {"auc": test_step["mAUC"], "acc": test_step["mACC"]}
+            }
+        })
+        wandb.log({
+            "test_mAUC": test_step["mAUC"],
+            "test_mACC": test_step["mACC"],
+        })
+        
+        with open("./logs/chexpert_convnextv2_logs.json", 'w') as f:
+            json.dump(json.loads(json.dumps(str(output))), f)
+            
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'loss': loss.item()
+        }, model_save_path)
+        
+    except Exception as e:
+        print("Exception: ", e)
+    finally:
+        wandb.finish()

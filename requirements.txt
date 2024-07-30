@@ -1,0 +1,13 @@
+numpy
+tqdm
+scikit-image
+scikit-learn
+scipy
+pydicom
+opencv-python
+timm==0.5.4
+transformers==4.1.1 
+albumentations==0.4.3
+imgaug
+Pillow
+pretrainedmodels
